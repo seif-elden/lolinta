@@ -102,6 +102,95 @@ private:
             }
         }
     }
+// Case Statement Checks
+void checkCaseStatements() {
+    regex casePattern(R"(case\s*\((\w+)\))");
+    regex endCasePattern(R"(endcase)");
+    regex defaultPattern(R"(default:)");
+    regex conditionPattern(R"(\s*(\d+'[bB]?\w+|[a-zA-Z_]\w*)\s*:)");
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        string line = lines[i];
+        smatch match;
+
+        // Detect the start of a case statement
+        if (regex_search(line, match, casePattern)) {
+            unordered_set<string> cases;
+            bool hasDefault = false;
+            size_t caseStartLine = i;
+
+            // Traverse lines to find the end of the case block
+            while (++i < lines.size()) {
+                line = lines[i];
+                // Check for `default` case
+                if (regex_search(line, defaultPattern)) {
+                    hasDefault = true;
+                }
+
+                // Check for conditions
+                smatch conditionMatch;
+                if (regex_search(line, conditionMatch, conditionPattern)) {
+                    string condition = conditionMatch[1];
+                    if (cases.find(condition) != cases.end()) {
+                        violations.push_back({ "Duplicate condition in case statement: " + condition, i + 1 });
+                    }
+                    cases.insert(condition);
+                }
+
+                // Break on `endcase`
+                if (regex_search(line, endCasePattern)) {
+                    break;
+                }
+            }
+
+            // Check for missing default case
+            if (!hasDefault) {
+                violations.push_back({ "Missing default case in case statement starting at line " + to_string(caseStartLine + 1), caseStartLine + 1 });
+            }
+        }
+    }
+}
+
+// Arithmetic Overflow Checks
+void checkArithmeticOverflow() {
+    regex arithmeticPattern(R"(\s*(\w+)\s*=\s*(.+);)");
+    regex operationPattern(R"((\w+)\s*([\+\-\*/])\s*(\w+))");
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        string line = lines[i];
+        smatch match;
+
+        // Detect assignment statements
+        if (regex_search(line, match, arithmeticPattern)) {
+            string expression = match[2];
+
+            // Check for arithmetic operations
+            smatch opMatch;
+            if (regex_search(expression, opMatch, operationPattern)) {
+                string operand1 = opMatch[1];
+                string operation = opMatch[2];
+                string operand2 = opMatch[3];
+
+                // Simplified logic: Assume 32-bit operands for this example
+                int bitWidth = 32; // Assume 32-bit operands for simplicity
+                bool overflow = false;
+
+                if (operation == "+" || operation == "-") {
+                    // Check if the result exceeds bit width
+                    overflow = (operand1.length() > bitWidth || operand2.length() > bitWidth);
+                } else if (operation == "*" || operation == "/") {
+                    // Multiplication or division overflow checks
+                    overflow = (operand1.length() * operand2.length() > bitWidth);
+                }
+
+                if (overflow) {
+                    violations.push_back({ "Potential arithmetic overflow in operation: " + operand1 + " " + operation + " " + operand2, i + 1 });
+                }
+            }
+        }
+    }
+}
+
 
     bool evaluateExpressionForX(const string& expression) {
         unordered_map<char, unordered_map<char, char>> andTruthTable = {
@@ -226,6 +315,8 @@ public:
         checkUninitializedRegisters();
         checkXPropagation();
         checkCombinationalLoops();
+        checkCaseStatements();
+        checkArithmeticOverflow();
     }
 
     void reportViolations() const {

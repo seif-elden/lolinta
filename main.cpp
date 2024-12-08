@@ -47,6 +47,56 @@ private:
     vector<string> lines;
     vector<Violation> violations;
 
+
+     // FSM Unreachable States Check
+    void checkUnreachableFSMStates() {
+        regex casePattern(R"(case\s*\((\w+)\))");
+        regex statePattern(R"(\s*(\w+)\s*:)");  // Matches state labels in `case` blocks
+        regex transitionPattern(R"(\s*(\w+)\s*<=\s*(\w+);)"); // Matches state transitions
+
+        unordered_set<string> allStates;       // Set of all defined states
+        unordered_set<string> reachableStates; // Set of reachable states
+
+        bool inCaseBlock = false;
+
+        for (size_t i = 0; i < lines.size(); ++i) {
+            string line = lines[i];
+            smatch match;
+
+            // Detect the start of a case block
+            if (regex_search(line, match, casePattern)) {
+                inCaseBlock = true;
+                continue;
+            }
+
+            // Detect the end of a case block
+            if (inCaseBlock && line.find("endcase") != string::npos) {
+                inCaseBlock = false;
+                continue;
+            }
+
+            // If inside a case block, collect all state labels
+            if (inCaseBlock && regex_search(line, match, statePattern)) {
+                allStates.insert(match[1]);
+            }
+
+            // Detect state transitions (state <= NEXT_STATE;)
+            if (regex_search(line, match, transitionPattern)) {
+                reachableStates.insert(match[2]);
+            }
+        }
+
+        // Identify unreachable states
+        for (const auto& state : allStates) {
+            if (reachableStates.find(state) == reachableStates.end()) {
+                violations.push_back({ "Unreachable FSM state: " + state, 0 });
+            }
+        }
+    }
+
+
+
+
     // Initialization Checks
     void checkUninitializedRegisters() {
         regex regPattern("\\breg\\b\\s+(\\w+)"); // Matches reg declarations

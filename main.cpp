@@ -49,50 +49,70 @@ private:
 
 
      // FSM Unreachable States Check
-    void checkUnreachableFSMStates() {
-        regex casePattern(R"(case\s*\((\w+)\))");
-        regex statePattern(R"(\s*(\w+)\s*:)");  // Matches state labels in `case` blocks
-        regex transitionPattern(R"(\s*(\w+)\s*<=\s*(\w+);)"); // Matches state transitions
+void checkUnreachableFSMStates() {
+    regex casePattern(R"(case\s*\(?\s*(\w+)\s*\)?)");         // Matches: case (state)
+    regex statePattern(R"(\s*(\w+)\s*:)");                   // Matches state labels in `case` blocks
+    regex transitionPattern(R"(\s*(\w+)\s*<=\s*(\w+);)");    // Matches state transitions: state <= next_state;
+    regex fsmStateUpdatePattern(R"((\w+)\s*<=\s*(\w+);)");   // Detect state updates outside case blocks
 
-        unordered_set<string> allStates;       // Set of all defined states
-        unordered_set<string> reachableStates; // Set of reachable states
+    unordered_set<string> allStates;       // Set of all defined states in case block
+    unordered_set<string> reachableStates; // Set of reachable states
+    string currentStateVariable;           // FSM state variable (e.g., "state")
+    bool inCaseBlock = false;              // Flag to indicate being inside a case block
+    bool isFSM = false;                    // Flag to validate FSM case block
 
-        bool inCaseBlock = false;
+    // Step 1: First pass to detect the FSM state variable (state <= next_state)
+    for (const string& line : lines) {
+        smatch match;
+        if (regex_search(line, match, fsmStateUpdatePattern)) {
+            currentStateVariable = match[1]; // Extract the state variable being updated
+            break;
+        }
+    }
 
-        for (size_t i = 0; i < lines.size(); ++i) {
-            string line = lines[i];
-            smatch match;
+    // Step 2: Parse lines to find FSM case blocks and transitions
+    for (size_t i = 0; i < lines.size(); ++i) {
+        string line = lines[i];
+        smatch match;
 
-            // Detect the start of a case block
-            if (regex_search(line, match, casePattern)) {
+        // Detect the start of a case block
+        if (regex_search(line, match, casePattern)) {
+            string stateVar = match[1];
+            if (stateVar == currentStateVariable) { // Ensure case is based on the FSM state variable
                 inCaseBlock = true;
-                continue;
+                isFSM = true; // Mark as FSM case block
+            } else {
+                inCaseBlock = false; // Not an FSM block
             }
-
-            // Detect the end of a case block
-            if (inCaseBlock && line.find("endcase") != string::npos) {
-                inCaseBlock = false;
-                continue;
-            }
-
-            // If inside a case block, collect all state labels
-            if (inCaseBlock && regex_search(line, match, statePattern)) {
-                allStates.insert(match[1]);
-            }
-
-            // Detect state transitions (state <= NEXT_STATE;)
-            if (regex_search(line, match, transitionPattern)) {
-                reachableStates.insert(match[2]);
-            }
+            continue;
         }
 
-        // Identify unreachable states
+        // Detect the end of a case block
+        if (inCaseBlock && line.find("endcase") != string::npos) {
+            inCaseBlock = false;
+            continue;
+        }
+
+        // If inside a valid FSM case block, collect all state labels
+        if (inCaseBlock && regex_search(line, match, statePattern)) {
+            allStates.insert(match[1]);
+        }
+
+        // Detect state transitions (state <= next_state;)
+        if (isFSM && regex_search(line, match, transitionPattern)) {
+            reachableStates.insert(match[2]); // Track destination states
+        }
+    }
+
+    // Step 3: Identify unreachable states
+    if (isFSM) {
         for (const auto& state : allStates) {
             if (reachableStates.find(state) == reachableStates.end()) {
                 violations.push_back({ "Unreachable FSM state: " + state, 0 });
             }
         }
     }
+}
 
 
 
@@ -284,6 +304,87 @@ void checkArithmeticOverflow() {
         return result == 'x';
     }
 
+// Function to detect unreachable branches
+    void checkDeadCode() {
+    regex regRegex(R"(\s*reg\s*\[\s*(\d+)\s*:\s*0\s*\]\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*;)");
+    regex caseRegex(R"(\s*case\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\))");
+    regex caseBranchRegex(R"(\s*(\d+'b[01]+)\s*:.*)");
+    regex ifElseRegex(R"(\s*(if|else if|else)\s*\(?\s*.*?\)?\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(\d+'b[01]+)\s*;)");
+    regex ifConditionRegex(R"(\s*(if|else if)\s*\(\s*(.*?)\s*\))");  // To match if and else if conditions
+
+    string currentSelector;
+    unordered_set<string> reachableValues; // Track reachable values
+    vector<string> caseBranches;           // Values from case statement
+    bool inCaseBlock = false;
+    unordered_set<int> unreachableIfElseLines; // To track unreachable if-else lines
+
+    for (size_t lineNumber = 0; lineNumber < lines.size(); ++lineNumber) {
+        string line = lines[lineNumber];
+        smatch match;
+
+        // Detect register declaration
+        if (regex_search(line, match, regRegex)) {
+            currentSelector = match[2];
+        }
+
+        // Track assignments to the selector variable
+        if (regex_search(line, match, ifElseRegex)) {
+            if (match[2] == currentSelector) {
+                reachableValues.insert(match[3]); // Add assigned value
+            }
+        }
+
+        // Start analyzing a case block
+        if (regex_search(line, match, caseRegex)) {
+            if (match[1] == currentSelector) {
+                inCaseBlock = true;
+                caseBranches.clear();
+            }
+        }
+
+        // Collect values in case branches
+        if (inCaseBlock && regex_search(line, match, caseBranchRegex)) {
+            caseBranches.push_back(match[1]);
+        }
+
+        // End of case block
+        if (inCaseBlock && line.find("endcase") != string::npos) {
+            inCaseBlock = false;
+
+            // Compare reachable values with case branches
+            unordered_set<string> unreachableBranches;
+            for (const auto& branch : caseBranches) {
+                if (reachableValues.find(branch) == reachableValues.end()) {
+                    unreachableBranches.insert(branch);
+                }
+            }
+
+            // Report unreachable branches
+            for (const auto& branch : unreachableBranches) {
+                violations.push_back({ "Unreachable 'case' branch: " + branch, 0 });
+            }
+        }
+
+        // Check for unreachable if-else conditions
+        if (regex_search(line, match, ifConditionRegex)) {
+            string condition = match[2];
+
+            // For simplicity, assume conditions that are always false (simplified analysis)
+            // This is a basic condition check (you may need to extend this to fully evaluate the condition)
+            if (condition == "1'b0" || condition == "0") { // Example: Always false condition
+                unreachableIfElseLines.insert(lineNumber + 1); // Mark this line as unreachable
+            }
+        }
+    }
+
+    // Report unreachable if-else branches
+    for (const auto& line : unreachableIfElseLines) {
+        violations.push_back({ "Unreachable if-else statement at line: " + to_string(line), line });
+    }
+}
+
+
+
     // Combinational Loop Checks
     void checkCombinationalLoops() {
         // Data structure to represent the dependency graph
@@ -362,11 +463,13 @@ public:
     explicit StaticChecker(const vector<string>& lines) : lines(lines) {}
 
     void runChecks() {
+        checkUnreachableFSMStates();
         checkUninitializedRegisters();
         checkXPropagation();
         checkCombinationalLoops();
         checkCaseStatements();
         checkArithmeticOverflow();
+        checkDeadCode();
     }
 
     void reportViolations() const {

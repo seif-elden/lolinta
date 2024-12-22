@@ -424,6 +424,59 @@ Combinational loop detected involving node: c
 
 
 
+### **4: `checkLatchInference()`**
+
+**Purpose**:
+
+- Detects cases where latches are inferred in the Verilog code due to incomplete assignments in combinational always blocks. Latches can lead to unintended behavior if not explicitly designed.
+
+**Key Concepts**:
+
+1. Latch Inference:
+
+- Latches are inferred when not all output variables are assigned in all execution paths of a combinational always block.
+- For example, if a signal is conditionally assigned (if, case) and not given a default value for other conditions, a latch is created to  -"remember" the signal's previous state.
+- Combinational always Block:
+
+Declared with sensitivity lists like @(*) or @(a, b).
+Should ensure all variables have deterministic values for all possible inputs.
+How It Works: The function analyzes always blocks in Verilog code, checking if:
+
+Any output variable is conditionally assigned but lacks a default value.
+
+
+### **Step-by-Step Explanation**:
+
+1. Regex Patterns:
+
+\\balways\\s*@\\(\\*\\):
+Captures the start of a combinational always block.
+\\bcase\\b.*\\(.*\\):
+Identifies case statements.
+(\\w+)\\s*=\\s*.+;:
+Matches assignments to variables (e.g., x = value;).
+Data Structures:
+
+assignedVariables: Tracks all variables assigned within the block.
+declaredVariables: Tracks all variables declared in the scope.
+Analysis:
+
+Default Assignment Check:
+Detects if variables are assigned a value outside of conditional constructs.
+Flags variables without unconditional assignments.
+Case Statement Analysis:
+Ensures default branches are present in case statements.
+Execution Path Coverage:
+Ensures all possible paths assign values to variables.
+Violation Reporting:
+
+If a variable lacks a default assignment or a case statement lacks a default branch, a warning is generated.
+Output: The function generates two types of warnings:
+
+Latch Inference:
+Warns about variables that are not fully assigned in all paths.
+
+
 
 
 

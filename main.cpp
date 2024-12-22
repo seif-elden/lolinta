@@ -11,6 +11,17 @@
 
 using namespace std;
 
+// Utility function to remove comments from Verilog code (Helper Function For latch Inference)
+string removeComments(const string &code) {
+    string cleanedCode = code;
+    // Remove single-line comments (//)
+    cleanedCode = regex_replace(cleanedCode, regex(R"(//.*)"), "");
+    // Remove block comments (/* ... */)
+    cleanedCode = regex_replace(cleanedCode, regex(R"(/\*[\s\S]*?\*/)"), "");
+    return cleanedCode;
+}
+
+
 // Violation Struct
 struct Violation {
     string message;
@@ -385,6 +396,96 @@ void checkArithmeticOverflow() {
 
 
 
+
+    //Infered Latches Checks
+    void checkLatchInference() {
+        string verilogCode;
+        for (const auto &line : lines) {
+            verilogCode += line + "\n";
+        }
+
+        // Remove comments from the Verilog code to avoid false matches
+        verilogCode = removeComments(verilogCode);
+
+        // Regular expression to match always blocks
+        regex alwaysBlockRegex(R"(always\s*@\*\s*begin([\s\S]*?)end\s*)");
+        smatch alwaysBlockMatch;
+        vector<string> alwaysBlocks;
+
+        // Extract all always blocks
+        auto codeBegin = verilogCode.cbegin();
+        auto codeEnd = verilogCode.cend();
+        while (regex_search(codeBegin, codeEnd, alwaysBlockMatch, alwaysBlockRegex)) {
+            alwaysBlocks.push_back(alwaysBlockMatch[1].str());
+            codeBegin = alwaysBlockMatch.suffix().first;
+        }
+
+        // Process each always block
+        for (const auto &block : alwaysBlocks) {
+            istringstream blockStream(block);
+            string currentLine;
+            stack<bool> ifHasElseStack;      // Tracks if each if has an else
+            stack<int> blockDepthStack;     // Tracks nested block depths
+
+            int currentDepth = 0;
+            int lineNumber = 0;
+            bool latchDetected = false;
+
+            while (getline(blockStream, currentLine)) {
+                ++lineNumber;
+
+                // Remove leading/trailing whitespace for cleaner processing
+                currentLine = regex_replace(currentLine, regex(R"(^\s+|\s+$)"), "");
+
+                // Match "if", "else", "begin", and "end" statements
+                regex ifRegex(R"(\bif\s*\()");
+                regex elseRegex(R"(\belse\b)");
+                regex beginRegex(R"(\bbegin\b)");
+                regex endRegex(R"(\bend\b)");
+
+                // Handle "begin" statements (nested blocks)
+                if (regex_search(currentLine, beginRegex)) {
+                    ++currentDepth;
+                }
+                // Handle "end" statements
+                else if (regex_search(currentLine, endRegex)) {
+                    if (!blockDepthStack.empty() && blockDepthStack.top() == currentDepth) {
+                        blockDepthStack.pop();
+                        if (!ifHasElseStack.empty()) {
+                            ifHasElseStack.pop();
+                        }
+                    }
+                    --currentDepth;
+                }
+
+                // Handle "if" statements
+                else if (regex_search(currentLine, ifRegex)) {
+                    ifHasElseStack.push(false); // Push a new if without an else initially
+                    blockDepthStack.push(currentDepth); // Track its block depth
+                }
+                // Handle "else" statements
+                else if (regex_search(currentLine, elseRegex)) {
+                    if (!ifHasElseStack.empty() && blockDepthStack.top() == currentDepth) {
+                        ifHasElseStack.top() = true; // Mark the most recent if as having an else
+                    }
+                }
+            }
+
+            // After processing, any if without an else means a latch
+            while (!ifHasElseStack.empty()) {
+                if (!ifHasElseStack.top() && !latchDetected) {
+                    violations.push_back({"Potential inferred latch found in always block.", lineNumber});
+                    latchDetected = true;
+                }
+                ifHasElseStack.pop();
+            }
+        }
+    }
+
+
+
+
+
     // Combinational Loop Checks
     void checkCombinationalLoops() {
         // Data structure to represent the dependency graph
@@ -417,8 +518,8 @@ void checkArithmeticOverflow() {
             }
         }
 
-        // Declare the recursive function using std::function
-        std::function<bool(const string&, unordered_set<string>&, unordered_set<string>&)> hasCycle =
+        // Declare the recursive function using function
+        function<bool(const string&, unordered_set<string>&, unordered_set<string>&)> hasCycle =
             [&](const string& node, unordered_set<string>& visited, unordered_set<string>& recursionStack) -> bool {
             if (recursionStack.find(node) != recursionStack.end()) {
                 // Node is already in the recursion stack, indicating a cycle
@@ -470,6 +571,7 @@ public:
         checkCaseStatements();
         checkArithmeticOverflow();
         checkDeadCode();
+        checkLatchInference();
     }
 
     void reportViolations() const {

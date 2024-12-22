@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "*.ejs": "html",
+        "unordered_set": "cpp",
+        "ostream": "cpp"
+    }
+}

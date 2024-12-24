@@ -396,91 +396,111 @@ void checkArithmeticOverflow() {
 
 
 
+// Check Latch Inference
+void checkLatchInference() {
+    string verilogCode;
+    for (const auto &line : lines) {
+        verilogCode += line + "\n";
+    }
 
-    //Infered Latches Checks
-    void checkLatchInference() {
-        string verilogCode;
-        for (const auto &line : lines) {
-            verilogCode += line + "\n";
-        }
+    // Remove comments from the Verilog code to avoid false matches
+    verilogCode = removeComments(verilogCode);
 
-        // Remove comments from the Verilog code to avoid false matches
-        verilogCode = removeComments(verilogCode);
+    // Regular expression to match always blocks
+    regex alwaysBlockRegex(R"(always\s*@\*\s*begin([\s\S]*?)end\s*)");
+    smatch alwaysBlockMatch;
+    vector<string> alwaysBlocks;
 
-        // Regular expression to match always blocks
-        regex alwaysBlockRegex(R"(always\s*@\*\s*begin([\s\S]*?)end\s*)");
-        smatch alwaysBlockMatch;
-        vector<string> alwaysBlocks;
+    // Extract all always blocks
+    auto codeBegin = verilogCode.cbegin();
+    auto codeEnd = verilogCode.cend();
+    while (regex_search(codeBegin, codeEnd, alwaysBlockMatch, alwaysBlockRegex)) {
+        alwaysBlocks.push_back(alwaysBlockMatch[1].str());
+        codeBegin = alwaysBlockMatch.suffix().first;
+    }
 
-        // Extract all always blocks
-        auto codeBegin = verilogCode.cbegin();
-        auto codeEnd = verilogCode.cend();
-        while (regex_search(codeBegin, codeEnd, alwaysBlockMatch, alwaysBlockRegex)) {
-            alwaysBlocks.push_back(alwaysBlockMatch[1].str());
-            codeBegin = alwaysBlockMatch.suffix().first;
-        }
+    // Process each always block
+    for (const auto &block : alwaysBlocks) {
+        istringstream blockStream(block);
+        string currentLine;
+        stack<bool> ifHasElseStack;  // Tracks if each if has an else
+        stack<int> blockDepthStack; // Tracks nested block depths
+        bool latchDetected = false;
+        bool caseMissingDefault = false;
 
-        // Process each always block
-        for (const auto &block : alwaysBlocks) {
-            istringstream blockStream(block);
-            string currentLine;
-            stack<bool> ifHasElseStack;      // Tracks if each if has an else
-            stack<int> blockDepthStack;     // Tracks nested block depths
+        int currentDepth = 0;
+        int lineNumber = 0;
+        bool insideCase = false; // Tracks if we are inside a case statement
 
-            int currentDepth = 0;
-            int lineNumber = 0;
-            bool latchDetected = false;
+        while (getline(blockStream, currentLine)) {
+            ++lineNumber;
 
-            while (getline(blockStream, currentLine)) {
-                ++lineNumber;
+            // Remove leading/trailing whitespace for cleaner processing
+            currentLine = regex_replace(currentLine, regex(R"(^\s+|\s+$)"), "");
 
-                // Remove leading/trailing whitespace for cleaner processing
-                currentLine = regex_replace(currentLine, regex(R"(^\s+|\s+$)"), "");
+            // Match patterns for Verilog constructs
+            regex ifRegex(R"(\bif\s*\()");
+            regex elseRegex(R"(\belse\b)");
+            regex beginRegex(R"(\bbegin\b)");
+            regex endRegex(R"(\bend\b)");
+            regex caseRegex(R"(\bcase\b)");
+            regex endcaseRegex(R"(\bendcase\b)");
+            regex defaultRegex(R"(\bdefault\b)");
 
-                // Match "if", "else", "begin", and "end" statements
-                regex ifRegex(R"(\bif\s*\()");
-                regex elseRegex(R"(\belse\b)");
-                regex beginRegex(R"(\bbegin\b)");
-                regex endRegex(R"(\bend\b)");
-
-                // Handle "begin" statements (nested blocks)
-                if (regex_search(currentLine, beginRegex)) {
-                    ++currentDepth;
-                }
-                // Handle "end" statements
-                else if (regex_search(currentLine, endRegex)) {
-                    if (!blockDepthStack.empty() && blockDepthStack.top() == currentDepth) {
-                        blockDepthStack.pop();
-                        if (!ifHasElseStack.empty()) {
-                            ifHasElseStack.pop();
-                        }
-                    }
-                    --currentDepth;
-                }
-
-                // Handle "if" statements
-                else if (regex_search(currentLine, ifRegex)) {
-                    ifHasElseStack.push(false); // Push a new if without an else initially
-                    blockDepthStack.push(currentDepth); // Track its block depth
-                }
-                // Handle "else" statements
-                else if (regex_search(currentLine, elseRegex)) {
-                    if (!ifHasElseStack.empty() && blockDepthStack.top() == currentDepth) {
-                        ifHasElseStack.top() = true; // Mark the most recent if as having an else
+            // Handle "begin" statements (nested blocks)
+            if (regex_search(currentLine, beginRegex)) {
+                ++currentDepth;
+            }
+            // Handle "end" statements
+            else if (regex_search(currentLine, endRegex)) {
+                if (!blockDepthStack.empty() && blockDepthStack.top() == currentDepth) {
+                    blockDepthStack.pop();
+                    if (!ifHasElseStack.empty()) {
+                        ifHasElseStack.pop();
                     }
                 }
+                --currentDepth;
             }
-
-            // After processing, any if without an else means a latch
-            while (!ifHasElseStack.empty()) {
-                if (!ifHasElseStack.top() && !latchDetected) {
-                    violations.push_back({"Potential inferred latch found in always block.", lineNumber});
-                    latchDetected = true;
+            // Handle "if" statements
+            else if (regex_search(currentLine, ifRegex)) {
+                ifHasElseStack.push(false); // Push a new if without an else initially
+                blockDepthStack.push(currentDepth); // Track its block depth
+            }
+            // Handle "else" statements
+            else if (regex_search(currentLine, elseRegex)) {
+                if (!ifHasElseStack.empty() && blockDepthStack.top() == currentDepth) {
+                    ifHasElseStack.top() = true; // Mark the most recent if as having an else
                 }
-                ifHasElseStack.pop();
             }
+            // Handle "case" statements
+            else if (regex_search(currentLine, caseRegex)) {
+                insideCase = true;
+                caseMissingDefault = true; // Assume missing default until proven otherwise
+            }
+            // Handle "default" within a case statement
+            else if (insideCase && regex_search(currentLine, defaultRegex)) {
+                caseMissingDefault = false; // Default branch found
+            }
+            // Handle "endcase"
+            else if (regex_search(currentLine, endcaseRegex)) {
+                if (insideCase && caseMissingDefault) {
+                    violations.push_back({"Missing default branch in case statement.", lineNumber});
+                }
+                insideCase = false; // Exit the case context
+            }
+        }
+
+        // After processing, any if without an else means a latch
+        while (!ifHasElseStack.empty()) {
+            if (!ifHasElseStack.top() && !latchDetected) {
+                violations.push_back({"Potential inferred latch found in always block.", lineNumber});
+                latchDetected = true;
+            }
+            ifHasElseStack.pop();
         }
     }
+}
+
 
 
 

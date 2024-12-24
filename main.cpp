@@ -537,7 +537,10 @@ private:
         // Matches: reg [3:0] a, b; (including multiple variables)
 
         regex assignmentPattern(R"(\s*(\w+)\s*=\s*(.+);)");          // Matches assignment statements
-        regex operationPattern(R"((\w+)\s*([\+\-\*\/])\s(\w+))");
+        regex operationPattern(R"((\w+|\d+|\d+'\w+)\s*([\+\-\*/])\s*(\d+'\w+|\d+|\w+))");
+        // Matches variables (e.g., a), constants (e.g., 10, 4'b1101), and operations
+
+        regex zeroPattern(R"(\d+'b0+$)");
 
         unordered_map<string, int> variableBitWidths; // Map to store bit widths for variables
 
@@ -562,8 +565,34 @@ private:
             }
         }
 
+        // Helper function to calculate bit-width of constants
+        auto getBitWidthForConstant = [](const string& constant) {
+            if (constant.find("'") != string::npos) {
+                // If it's a Verilog literal (e.g., 4'b1101 or 8'hFF)
+                size_t delimiterPos = constant.find("'");
+
+                // Extract the bit width before the `'`
+                int width = stoi(constant.substr(0, delimiterPos));
+
+
+                return width;
+            }
+            else {
+                // Otherwise, it's a decimal constant, calculate bit width based on its value
+                int value = stoi(constant);
+                int width = 0;
+                while (value > 0) {
+                    value >>= 1;
+                    width++;
+                }
+                return width > 0 ? width : 1; // At least 1 bit for zero
+            }
+            };
+
+
+
         // Step 2: Detect arithmetic operations and check for overflow
-        for (int i = 0; i < lines.size(); ++i) {
+        for (size_t i = 0; i < lines.size(); ++i) {
             string line = lines[i];
             smatch match;
 
@@ -578,30 +607,54 @@ private:
                     string operation = opMatch[2];
                     string operand2 = opMatch[3];
 
+
+
                     // Determine bit widths of the operands
-                    int bitWidth1 = variableBitWidths.count(operand1) ? variableBitWidths[operand1] : 8;
-                    int bitWidth2 = variableBitWidths.count(operand2) ? variableBitWidths[operand2] : 8;
+                    int bitWidth1 = 0;
+                    int bitWidth2 = 0;
+
+                    // Check if operand1 is a constant or variable
+                    if (operand1.find("'") != string::npos || isdigit(operand1[0])) {
+                        bitWidth1 = getBitWidthForConstant(operand1); // Operand1 is a constant
+                    }
+                    else {
+                        bitWidth1 = variableBitWidths.count(operand1) ? variableBitWidths[operand1] : 8; // Operand1 is a variable
+                    }
+
+                    // Check if operand2 is a constant or variable
+                    if (operand2.find("'") != string::npos || isdigit(operand2[0])) {
+                        bitWidth2 = getBitWidthForConstant(operand2); // Operand2 is a constant
+                    }
+                    else {
+                        bitWidth2 = variableBitWidths.count(operand2) ? variableBitWidths[operand2] : 8; // Operand2 is a variable
+                    }
+
                     int resultBitWidth = variableBitWidths.count(destination) ? variableBitWidths[destination] : 8;
 
+
+
+
                     bool overflow = false;
+
                     // Check for overflow conditions
                     if (operation == "+") {
                         overflow = (max(bitWidth1, bitWidth2) + 1 > resultBitWidth); // +1 for carry
-
                     }
                     else if (operation == "-") {
-                        overflow = (bitWidth1 < bitWidth2 );
+                        overflow = (bitWidth1 >  bitWidth2) ;
                     }
                     else if (operation == "*") {
                         overflow = (bitWidth1 + bitWidth2 > resultBitWidth);
                     }
-                    
+                    else if (operation == "/") {
+                        overflow = regex_match(operand2, zeroPattern) ? 1 : 0; // Division by zero check
+                    }
 
                     // Report potential overflow
                     if (overflow) {
                         violations.push_back({
                             "Potential arithmetic overflow in operation: " + operand1 + " " + operation + " " + operand2,
-                            i + 1
+                            static_cast<int>(i + 1)
                             });
                     }
                 }
@@ -609,19 +662,17 @@ private:
         }
     }
 
-
 public:
     explicit StaticChecker(const vector<string>& lines) : lines(lines) {}
 
     void runChecks() {
-        //checkUnreachableFSMStates();
-        //checkUninitializedRegisters();
-        //checkLatchInference();
-        //checkXPropagation();
-        //checkCombinationalLoops();
-        //checkCaseStatements();
-        //checkDeadCode();
-
+        checkUnreachableFSMStates();
+        checkUninitializedRegisters();
+        checkLatchInference();
+        checkXPropagation();
+        checkCombinationalLoops();
+        checkCaseStatements();
+        checkDeadCode();
         checkArithmeticOverflow();
 
     }

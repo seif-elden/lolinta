@@ -8,11 +8,13 @@
 #include <unordered_set>
 #include <cctype>
 #include <sstream>
+#include <stack> 
+
 
 using namespace std;
 
 // Utility function to remove comments from Verilog code (Helper Function For latch Inference)
-string removeComments(const string &code) {
+string removeComments(const string& code) {
     string cleanedCode = code;
     // Remove single-line comments (//)
     cleanedCode = regex_replace(cleanedCode, regex(R"(//.*)"), "");
@@ -58,229 +60,206 @@ private:
     vector<string> lines;
     vector<Violation> violations;
 
+    // UnreachableFSM Checks
+    void checkUnreachableFSMStates() {
+        unordered_set<string> availableStates;                      // States defined in the case block
+        unordered_set<string> nextStates;                           // States transitioned to
+        unordered_map<string, int> stateLineMap;                    // Map to track the line number of each state
 
-     // FSM Unreachable States Check
-void checkUnreachableFSMStates() {
-    regex casePattern(R"(case\s*\(?\s*(\w+)\s*\)?)");         // Matches: case (state)
-    regex statePattern(R"(\s*(\w+)\s*:)");                   // Matches state labels in `case` blocks
-    regex transitionPattern(R"(\s*(\w+)\s*<=\s*(\w+);)");    // Matches state transitions: state <= next_state;
-    regex fsmStateUpdatePattern(R"((\w+)\s*<=\s*(\w+);)");   // Detect state updates outside case blocks
+        // Regular expression to parse FSM case states and transitions
+        regex stateRegex(R"((\w+)\s*:\s*state\s*<=\s*(\w+);)");
 
-    unordered_set<string> allStates;       // Set of all defined states in case block
-    unordered_set<string> reachableStates; // Set of reachable states
-    string currentStateVariable;           // FSM state variable (e.g., "state")
-    bool inCaseBlock = false;              // Flag to indicate being inside a case block
-    bool isFSM = false;                    // Flag to validate FSM case block
+        // Iterate through each line of the Verilog code
+        for (size_t i = 0; i < lines.size(); ++i) {
+            string line = lines[i];
+            smatch match;
 
-    // Step 1: First pass to detect the FSM state variable (state <= next_state)
-    for (const string& line : lines) {
-        smatch match;
-        if (regex_search(line, match, fsmStateUpdatePattern)) {
-            currentStateVariable = match[1]; // Extract the state variable being updated
-            break;
-        }
-    }
+            // Parse states in the case block
+            if (regex_search(line, match, stateRegex)) {
+                string availableState = match[1];  // State in the case block
+                string nextState = match[2];       // State transitioned to
 
-    // Step 2: Parse lines to find FSM case blocks and transitions
-    for (size_t i = 0; i < lines.size(); ++i) {
-        string line = lines[i];
-        smatch match;
+                availableStates.insert(availableState);
+                nextStates.insert(nextState);
 
-        // Detect the start of a case block
-        if (regex_search(line, match, casePattern)) {
-            string stateVar = match[1];
-            if (stateVar == currentStateVariable) { // Ensure case is based on the FSM state variable
-                inCaseBlock = true;
-                isFSM = true; // Mark as FSM case block
-            } else {
-                inCaseBlock = false; // Not an FSM block
+                // Map the state to its line number
+                if (stateLineMap.find(availableState) == stateLineMap.end()) {
+                    stateLineMap[availableState] = i + 1;  // Line numbers are 1-based
+                }
+
+
             }
-            continue;
         }
 
-        // Detect the end of a case block
-        if (inCaseBlock && line.find("endcase") != string::npos) {
-            inCaseBlock = false;
-            continue;
-        }
-
-        // If inside a valid FSM case block, collect all state labels
-        if (inCaseBlock && regex_search(line, match, statePattern)) {
-            allStates.insert(match[1]);
-        }
-
-        // Detect state transitions (state <= next_state;)
-        if (isFSM && regex_search(line, match, transitionPattern)) {
-            reachableStates.insert(match[2]); // Track destination states
-        }
-    }
-
-    // Step 3: Identify unreachable states
-    if (isFSM) {
-        for (const auto& state : allStates) {
-            if (reachableStates.find(state) == reachableStates.end()) {
-                violations.push_back({ "Unreachable FSM state: " + state, 0 });
+        // Identify unreachable states
+        for (const auto& state : availableStates) {
+            if (nextStates.find(state) == nextStates.end()) {
+                // If a state is defined in availableStates but not in nextStates, it's unreachable
+                int line = stateLineMap[state];  // Get the line number of the state
+                violations.push_back({
+                    "Unreachable FSM state: " + state,
+                    line  // Line number of the unreachable state
+                    });
             }
         }
     }
-}
 
 
+    // Check Latch Inference
+    void checkLatchInference() {
+        string verilogCode;
+        for (const auto& line : lines) {
+            verilogCode += line + "\n";
+        }
 
+        // Remove comments from the Verilog code to avoid false matches
+        verilogCode = removeComments(verilogCode);
+
+        // Regular expression to match always blocks
+        regex alwaysBlockRegex(R"(always\s*@\*\s*begin([\s\S]*?)end\s*)");
+        smatch alwaysBlockMatch;
+        vector<string> alwaysBlocks;
+
+        // Extract all always blocks
+        auto codeBegin = verilogCode.cbegin();
+        auto codeEnd = verilogCode.cend();
+        while (regex_search(codeBegin, codeEnd, alwaysBlockMatch, alwaysBlockRegex)) {
+            alwaysBlocks.push_back(alwaysBlockMatch[1].str());
+            codeBegin = alwaysBlockMatch.suffix().first;
+        }
+
+        // Process each always block
+        for (const auto& block : alwaysBlocks) {
+            istringstream blockStream(block);
+            string currentLine;
+            stack<bool> ifHasElseStack;  // Tracks if each if has an else
+            stack<int> blockDepthStack; // Tracks nested block depths
+            bool latchDetected = false;
+            bool caseMissingDefault = false;
+
+            int currentDepth = 0;
+            int lineNumber = 0;
+            bool insideCase = false; // Tracks if we are inside a case statement
+
+            while (getline(blockStream, currentLine)) {
+                ++lineNumber;
+
+                // Remove leading/trailing whitespace for cleaner processing
+                currentLine = regex_replace(currentLine, regex(R"(^\s+|\s+$)"), "");
+
+                // Match patterns for Verilog constructs
+                regex ifRegex(R"(\bif\s*\()");
+                regex elseRegex(R"(\belse\b)");
+                regex beginRegex(R"(\bbegin\b)");
+                regex endRegex(R"(\bend\b)");
+                regex caseRegex(R"(\bcase\b)");
+                regex endcaseRegex(R"(\bendcase\b)");
+                regex defaultRegex(R"(\bdefault\b)");
+
+                // Handle "begin" statements (nested blocks)
+                if (regex_search(currentLine, beginRegex)) {
+                    ++currentDepth;
+                }
+                // Handle "end" statements
+                else if (regex_search(currentLine, endRegex)) {
+                    if (!blockDepthStack.empty() && blockDepthStack.top() == currentDepth) {
+                        blockDepthStack.pop();
+                        if (!ifHasElseStack.empty()) {
+                            ifHasElseStack.pop();
+                        }
+                    }
+                    --currentDepth;
+                }
+                // Handle "if" statements
+                else if (regex_search(currentLine, ifRegex)) {
+                    ifHasElseStack.push(false); // Push a new if without an else initially
+                    blockDepthStack.push(currentDepth); // Track its block depth
+                }
+                // Handle "else" statements
+                else if (regex_search(currentLine, elseRegex)) {
+                    if (!ifHasElseStack.empty() && blockDepthStack.top() == currentDepth) {
+                        ifHasElseStack.top() = true; // Mark the most recent if as having an else
+                    }
+                }
+                // Handle "case" statements
+                else if (regex_search(currentLine, caseRegex)) {
+                    insideCase = true;
+                    caseMissingDefault = true; // Assume missing default until proven otherwise
+                }
+                // Handle "default" within a case statement
+                else if (insideCase && regex_search(currentLine, defaultRegex)) {
+                    caseMissingDefault = false; // Default branch found
+                }
+                // Handle "endcase"
+                else if (regex_search(currentLine, endcaseRegex)) {
+                    if (insideCase && caseMissingDefault) {
+                        violations.push_back({ "Missing default branch in case statement.", lineNumber });
+                    }
+                    insideCase = false; // Exit the case context
+                }
+            }
+
+            // After processing, any if without an else means a latch
+            while (!ifHasElseStack.empty()) {
+                if (!ifHasElseStack.top() && !latchDetected) {
+                    violations.push_back({ "Potential inferred latch found in always block.", lineNumber });
+                    latchDetected = true;
+                }
+                ifHasElseStack.pop();
+            }
+        }
+    }
 
     // Initialization Checks
     void checkUninitializedRegisters() {
-        regex regPattern("\\breg\\b\\s+(\\w+)"); // Matches reg declarations
-        regex assignmentPattern("(\\w+)\\s*=\\s*"); // Matches assignments
+        // Updated regex to capture registers with optional ranges (e.g., reg [3:0] reg1;)
+        regex regPattern("\\breg\\b(\\s*\\[[^\\]]+\\])?\\s+(\\w+);");
+        // Updated regex to capture assignments (e.g., reg1 = <value>;)
+        regex assignmentPattern("(\\w+)\\s*=\\s*");
 
-        unordered_set<string> declaredRegisters; // All declared registers
         unordered_set<string> initializedRegisters; // All initialized registers
+        unordered_map<string, int> declaredRegisters; // Map of declared registers and their line numbers
 
         for (int i = 0; i < lines.size(); ++i) {
             string line = lines[i];
             smatch match;
 
-            // Capture all declared registers
+            // Capture all declared registers and their line numbers
             if (regex_search(line, match, regPattern)) {
-                declaredRegisters.insert(match[1]);
+                string regName = match[2]; // The name of the register
+                if (declaredRegisters.find(regName) == declaredRegisters.end()) {
+                    declaredRegisters[regName] = i + 1; // Store the line number (1-based index)
+                }
             }
 
             // Capture all initialized registers
             if (regex_search(line, match, assignmentPattern)) {
-                initializedRegisters.insert(match[1]);
+                string regName = match[1]; // The name of the register being assigned
+                initializedRegisters.insert(regName);
             }
         }
 
         // Check for uninitialized registers
-        for (const string& reg : declaredRegisters) {
-            if (initializedRegisters.find(reg) == initializedRegisters.end()) {
-                violations.push_back({ "Uninitialized register: " + reg, 0 });
+        for (const auto& regEntry : declaredRegisters) {
+            const string& regName = regEntry.first;
+            int lineNumber = regEntry.second;
+            if (initializedRegisters.find(regName) == initializedRegisters.end()) {
+                violations.push_back({
+                    "Uninitialized register: " + regName,
+                    lineNumber
+                    });
             }
         }
     }
 
+    // X Propagation Checks
     void checkXPropagation() {
-        regex xPattern("\\b(\\d+'[bB]?[xX]+)\\b|\\b[Xx]\\b");
-        regex bitwisePattern("=\\s*(.+)\\s*;");
-
-        for (int i = 0; i < lines.size(); ++i) {
-            string line = lines[i];
-            smatch match;
-
-            // Check for X literals or standalone X in the line
-            if (regex_search(line, match, xPattern)) {
-                // Also check for bitwise operators
-                if (regex_search(line, match, bitwisePattern)) {
-                    string expression = match[1];
-                    if (evaluateExpressionForX(expression)) {
-                        violations.push_back({ "X propagation or reachability issue in expression: " + expression, i + 1 });
-                    }
-                }
-                else {
-                    // Directly report standalone X
-                    violations.push_back({ "X propagation or reachability issue", i + 1 });
-                }
-            }
-        }
-    }
-// Case Statement Checks
-void checkCaseStatements() {
-    regex casePattern(R"(case\s*\((\w+)\))");
-    regex endCasePattern(R"(endcase)");
-    regex defaultPattern(R"(default:)");
-    regex conditionPattern(R"(\s*(\d+'[bB]?\w+|[a-zA-Z_]\w*)\s*:)");
-
-    for (size_t i = 0; i < lines.size(); ++i) {
-        string line = lines[i];
-        smatch match;
-
-        // Detect the start of a case statement
-        if (regex_search(line, match, casePattern)) {
-            unordered_set<string> cases;
-            bool hasDefault = false;
-            size_t caseStartLine = i;
-
-            // Traverse lines to find the end of the case block
-            while (++i < lines.size()) {
-                line = lines[i];
-                // Check for `default` case
-                if (regex_search(line, defaultPattern)) {
-                    hasDefault = true;
-                }
-
-                // Check for conditions
-                smatch conditionMatch;
-                if (regex_search(line, conditionMatch, conditionPattern)) {
-                    string condition = conditionMatch[1];
-                    if (cases.find(condition) != cases.end()) {
-                        violations.push_back({ "Duplicate condition in case statement: " + condition, i + 1 });
-                    }
-                    cases.insert(condition);
-                }
-
-                // Break on `endcase`
-                if (regex_search(line, endCasePattern)) {
-                    break;
-                }
-            }
-
-            // Check for missing default case
-            if (!hasDefault) {
-                violations.push_back({ "Missing default case in case statement starting at line " + to_string(caseStartLine + 1), caseStartLine + 1 });
-            }
-        }
-    }
-}
-
-// Arithmetic Overflow Checks
-void checkArithmeticOverflow() {
-    regex arithmeticPattern(R"(\s*(\w+)\s*=\s*(.+);)");
-    regex operationPattern(R"((\w+)\s*([\+\-\*/])\s*(\w+))");
-
-    for (size_t i = 0; i < lines.size(); ++i) {
-        string line = lines[i];
-        smatch match;
-
-        // Detect assignment statements
-        if (regex_search(line, match, arithmeticPattern)) {
-            string expression = match[2];
-
-            // Check for arithmetic operations
-            smatch opMatch;
-            if (regex_search(expression, opMatch, operationPattern)) {
-                string operand1 = opMatch[1];
-                string operation = opMatch[2];
-                string operand2 = opMatch[3];
-
-                // Simplified logic: Assume 32-bit operands for this example
-                int bitWidth = 32; // Assume 32-bit operands for simplicity
-                bool overflow = false;
-
-                if (operation == "+" || operation == "-") {
-                    // Check if the result exceeds bit width
-                    overflow = (operand1.length() > bitWidth || operand2.length() > bitWidth);
-                } else if (operation == "*" || operation == "/") {
-                    // Multiplication or division overflow checks
-                    overflow = (operand1.length() * operand2.length() > bitWidth);
-                }
-
-                if (overflow) {
-                    violations.push_back({ "Potential arithmetic overflow in operation: " + operand1 + " " + operation + " " + operand2, i + 1 });
-                }
-            }
-        }
-    }
-}
-
-
-    bool evaluateExpressionForX(const string& expression) {
         unordered_map<char, unordered_map<char, char>> andTruthTable = {
             {'0', {{'0', '0'}, {'1', '0'}, {'x', '0'}, {'z', '0'}}},
             {'1', {{'0', '0'}, {'1', '1'}, {'x', 'x'}, {'z', 'x'}}},
             {'x', {{'0', '0'}, {'1', 'x'}, {'x', 'x'}, {'z', 'x'}}},
             {'z', {{'0', '0'}, {'1', 'x'}, {'x', 'x'}, {'z', 'x'}}}
         };
-
         unordered_map<char, unordered_map<char, char>> orTruthTable = {
             {'0', {{'0', '0'}, {'1', '1'}, {'x', 'x'}, {'z', 'x'}}},
             {'1', {{'0', '1'}, {'1', '1'}, {'x', '1'}, {'z', '1'}}},
@@ -288,223 +267,59 @@ void checkArithmeticOverflow() {
             {'z', {{'0', 'x'}, {'1', '1'}, {'x', 'x'}, {'z', 'x'}}}
         };
 
-        auto evaluate = [&](const string& expr) -> char {
-            string simplified = expr;
-            for (size_t i = 0; i < simplified.size(); ++i) {
-                if (simplified[i] == '&' || simplified[i] == '|') {
-                    char left = simplified[i - 1];
-                    char op = simplified[i];
-                    char right = simplified[i + 1];
-
-                    char result = (op == '&') ? andTruthTable[left][right] : orTruthTable[left][right];
-                    simplified.replace(i - 1, 3, 1, result);
-                    i = 0; // Restart evaluation
-                }
-            }
-            return simplified[0];
-            };
-
-        string preprocessed;
-        for (char c : expression) {
-            if (isdigit(c) || c == 'x' || c == 'X' || c == 'z' || c == 'Z' || c == '&' || c == '|') {
-                preprocessed += tolower(c);
-            }
-        }
-
-        char result = evaluate(preprocessed);
-        return result == 'x';
-    }
-
-// Function to detect unreachable branches
-    void checkDeadCode() {
-    regex regRegex(R"(\s*reg\s*\[\s*(\d+)\s*:\s*0\s*\]\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*;)");
-    regex caseRegex(R"(\s*case\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\))");
-    regex caseBranchRegex(R"(\s*(\d+'b[01]+)\s*:.*)");
-    regex ifElseRegex(R"(\s*(if|else if|else)\s*\(?\s*.*?\)?\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(\d+'b[01]+)\s*;)");
-    regex ifConditionRegex(R"(\s*(if|else if)\s*\(\s*(.*?)\s*\))");  // To match if and else if conditions
-
-    string currentSelector;
-    unordered_set<string> reachableValues; // Track reachable values
-    vector<string> caseBranches;           // Values from case statement
-    bool inCaseBlock = false;
-    unordered_set<int> unreachableIfElseLines; // To track unreachable if-else lines
-
-    for (size_t lineNumber = 0; lineNumber < lines.size(); ++lineNumber) {
-        string line = lines[lineNumber];
+        regex assignRegex(R"(assign\s+(\w+)\s*=\s*(.+);)");
         smatch match;
 
-        // Detect register declaration
-        if (regex_search(line, match, regRegex)) {
-            currentSelector = match[2];
-        }
+        for (size_t lineNum = 0; lineNum < lines.size(); ++lineNum) {
+            string line = lines[lineNum];
 
-        // Track assignments to the selector variable
-        if (regex_search(line, match, ifElseRegex)) {
-            if (match[2] == currentSelector) {
-                reachableValues.insert(match[3]); // Add assigned value
-            }
-        }
+            // Remove comments from the line
+            line = removeComments(line);
 
-        // Start analyzing a case block
-        if (regex_search(line, match, caseRegex)) {
-            if (match[1] == currentSelector) {
-                inCaseBlock = true;
-                caseBranches.clear();
-            }
-        }
+            if (regex_search(line, match, assignRegex)) {
+                string target = match[1];
+                string expression = match[2];
 
-        // Collect values in case branches
-        if (inCaseBlock && regex_search(line, match, caseBranchRegex)) {
-            caseBranches.push_back(match[1]);
-        }
-
-        // End of case block
-        if (inCaseBlock && line.find("endcase") != string::npos) {
-            inCaseBlock = false;
-
-            // Compare reachable values with case branches
-            unordered_set<string> unreachableBranches;
-            for (const auto& branch : caseBranches) {
-                if (reachableValues.find(branch) == reachableValues.end()) {
-                    unreachableBranches.insert(branch);
+                // Check for direct X propagation (e.g., assign c = 4'bxxxx;)
+                if (regex_search(expression, regex(R"(\b1'bx|4'bx{4}\b)"))) {
+                    violations.push_back({ "Direct X propagation to " + target, static_cast<int>(lineNum + 1) });
+                    continue;
                 }
-            }
 
-            // Report unreachable branches
-            for (const auto& branch : unreachableBranches) {
-                violations.push_back({ "Unreachable 'case' branch: " + branch, 0 });
-            }
-        }
+                // Evaluate the expression for bitwise operations
+                stack<char> evaluationStack;
+                for (char ch : expression) {
+                    if (isdigit(ch) || ch == 'x' || ch == 'z') {
+                        evaluationStack.push(ch);
+                    }
+                    else if (ch == '&' || ch == '|') {
+                        if (evaluationStack.size() < 2) {
+                      
+                            break;
+                        }
 
-        // Check for unreachable if-else conditions
-        if (regex_search(line, match, ifConditionRegex)) {
-            string condition = match[2];
+                        char b = evaluationStack.top(); evaluationStack.pop();
+                        char a = evaluationStack.top(); evaluationStack.pop();
+                        char result = 'x';
 
-            // For simplicity, assume conditions that are always false (simplified analysis)
-            // This is a basic condition check (you may need to extend this to fully evaluate the condition)
-            if (condition == "1'b0" || condition == "0") { // Example: Always false condition
-                unreachableIfElseLines.insert(lineNumber + 1); // Mark this line as unreachable
-            }
-        }
-    }
+                        if (ch == '&') {
+                            result = andTruthTable[a][b];
+                        }
+                        else if (ch == '|') {
+                            result = orTruthTable[a][b];
+                        }
 
-    // Report unreachable if-else branches
-    for (const auto& line : unreachableIfElseLines) {
-        violations.push_back({ "Unreachable if-else statement at line: " + to_string(line), line });
-    }
-}
-
-
-
-// Check Latch Inference
-void checkLatchInference() {
-    string verilogCode;
-    for (const auto &line : lines) {
-        verilogCode += line + "\n";
-    }
-
-    // Remove comments from the Verilog code to avoid false matches
-    verilogCode = removeComments(verilogCode);
-
-    // Regular expression to match always blocks
-    regex alwaysBlockRegex(R"(always\s*@\*\s*begin([\s\S]*?)end\s*)");
-    smatch alwaysBlockMatch;
-    vector<string> alwaysBlocks;
-
-    // Extract all always blocks
-    auto codeBegin = verilogCode.cbegin();
-    auto codeEnd = verilogCode.cend();
-    while (regex_search(codeBegin, codeEnd, alwaysBlockMatch, alwaysBlockRegex)) {
-        alwaysBlocks.push_back(alwaysBlockMatch[1].str());
-        codeBegin = alwaysBlockMatch.suffix().first;
-    }
-
-    // Process each always block
-    for (const auto &block : alwaysBlocks) {
-        istringstream blockStream(block);
-        string currentLine;
-        stack<bool> ifHasElseStack;  // Tracks if each if has an else
-        stack<int> blockDepthStack; // Tracks nested block depths
-        bool latchDetected = false;
-        bool caseMissingDefault = false;
-
-        int currentDepth = 0;
-        int lineNumber = 0;
-        bool insideCase = false; // Tracks if we are inside a case statement
-
-        while (getline(blockStream, currentLine)) {
-            ++lineNumber;
-
-            // Remove leading/trailing whitespace for cleaner processing
-            currentLine = regex_replace(currentLine, regex(R"(^\s+|\s+$)"), "");
-
-            // Match patterns for Verilog constructs
-            regex ifRegex(R"(\bif\s*\()");
-            regex elseRegex(R"(\belse\b)");
-            regex beginRegex(R"(\bbegin\b)");
-            regex endRegex(R"(\bend\b)");
-            regex caseRegex(R"(\bcase\b)");
-            regex endcaseRegex(R"(\bendcase\b)");
-            regex defaultRegex(R"(\bdefault\b)");
-
-            // Handle "begin" statements (nested blocks)
-            if (regex_search(currentLine, beginRegex)) {
-                ++currentDepth;
-            }
-            // Handle "end" statements
-            else if (regex_search(currentLine, endRegex)) {
-                if (!blockDepthStack.empty() && blockDepthStack.top() == currentDepth) {
-                    blockDepthStack.pop();
-                    if (!ifHasElseStack.empty()) {
-                        ifHasElseStack.pop();
+                        evaluationStack.push(result);
                     }
                 }
-                --currentDepth;
-            }
-            // Handle "if" statements
-            else if (regex_search(currentLine, ifRegex)) {
-                ifHasElseStack.push(false); // Push a new if without an else initially
-                blockDepthStack.push(currentDepth); // Track its block depth
-            }
-            // Handle "else" statements
-            else if (regex_search(currentLine, elseRegex)) {
-                if (!ifHasElseStack.empty() && blockDepthStack.top() == currentDepth) {
-                    ifHasElseStack.top() = true; // Mark the most recent if as having an else
-                }
-            }
-            // Handle "case" statements
-            else if (regex_search(currentLine, caseRegex)) {
-                insideCase = true;
-                caseMissingDefault = true; // Assume missing default until proven otherwise
-            }
-            // Handle "default" within a case statement
-            else if (insideCase && regex_search(currentLine, defaultRegex)) {
-                caseMissingDefault = false; // Default branch found
-            }
-            // Handle "endcase"
-            else if (regex_search(currentLine, endcaseRegex)) {
-                if (insideCase && caseMissingDefault) {
-                    violations.push_back({"Missing default branch in case statement.", lineNumber});
-                }
-                insideCase = false; // Exit the case context
-            }
-        }
 
-        // After processing, any if without an else means a latch
-        while (!ifHasElseStack.empty()) {
-            if (!ifHasElseStack.top() && !latchDetected) {
-                violations.push_back({"Potential inferred latch found in always block.", lineNumber});
-                latchDetected = true;
+                // Check the final result for X propagation
+                if (!evaluationStack.empty() && evaluationStack.top() == 'x') {
+                    violations.push_back({ "X propagation detected in expression assigned to " + target, static_cast<int>(lineNum + 1) });
+                }
             }
-            ifHasElseStack.pop();
         }
     }
-}
-
-
-
-
-
 
     // Combinational Loop Checks
     void checkCombinationalLoops() {
@@ -515,6 +330,7 @@ void checkLatchInference() {
         regex assignPattern(R"(assign\s+(\w+)\s*=\s*(.+);)");
 
         // Build the dependency graph
+        unordered_map<string, int> lineMap; // Map to store variable declaration line numbers
         for (int i = 0; i < lines.size(); ++i) {
             string line = lines[i];
             smatch match;
@@ -523,6 +339,9 @@ void checkLatchInference() {
             if (regex_search(line, match, assignPattern)) {
                 string lhs = match[1];        // Left-hand side (output)
                 string rhs = match[2];        // Right-hand side (expression)
+
+                // Record the line number for the left-hand side variable
+                lineMap[lhs] = i + 1;
 
                 // Extract all variables used in the right-hand side
                 regex varPattern(R"(\b\w+\b)");
@@ -539,10 +358,11 @@ void checkLatchInference() {
         }
 
         // Declare the recursive function using function
-        function<bool(const string&, unordered_set<string>&, unordered_set<string>&)> hasCycle =
-            [&](const string& node, unordered_set<string>& visited, unordered_set<string>& recursionStack) -> bool {
+        function<bool(const string&, unordered_set<string>&, unordered_set<string>&, string&)> hasCycle =
+            [&](const string& node, unordered_set<string>& visited, unordered_set<string>& recursionStack, string& firstNode) -> bool {
             if (recursionStack.find(node) != recursionStack.end()) {
                 // Node is already in the recursion stack, indicating a cycle
+                firstNode = node;
                 return true;
             }
 
@@ -557,7 +377,7 @@ void checkLatchInference() {
 
             // Recursively check all neighbors
             for (const string& neighbor : dependencyGraph[node]) {
-                if (hasCycle(neighbor, visited, recursionStack)) {
+                if (hasCycle(neighbor, visited, recursionStack, firstNode)) {
                     return true;
                 }
             }
@@ -573,8 +393,218 @@ void checkLatchInference() {
 
         for (const auto& entry : dependencyGraph) {
             const string& node = entry.first;
-            if (visited.find(node) == visited.end() && hasCycle(node, visited, recursionStack)) {
-                violations.push_back({ "Combinational loop detected involving node: " + node, 0 });
+            if (visited.find(node) == visited.end()) {
+                string firstNode;
+                if (hasCycle(node, visited, recursionStack, firstNode)) {
+                    int lineNum = lineMap.count(firstNode) ? lineMap[firstNode] : 0;
+                    violations.push_back({ "Combinational loop detected involving node: " + firstNode, lineNum });
+                }
+            }
+        }
+    }
+
+    // Case Statement Checks
+    void checkCaseStatements() {
+        regex casePattern(R"(case\s*\((\w+)\))");
+        regex endCasePattern(R"(endcase)");
+        regex defaultPattern(R"(default:)");
+        regex conditionPattern(R"(\s*(\d+'[bB]?\w+|[a-zA-Z_]\w*)\s*:)");
+
+        for (int i = 0; i < lines.size(); ++i) {
+            string line = lines[i];
+            smatch match;
+
+            // Detect the start of a case statement
+            if (regex_search(line, match, casePattern)) {
+                unordered_set<string> cases;
+                bool hasDefault = false;
+                int caseStartLine = i;
+
+                // Traverse lines to find the end of the case block
+                while (++i < lines.size()) {
+                    line = lines[i];
+                    // Check for `default` case
+                    if (regex_search(line, defaultPattern)) {
+                        hasDefault = true;
+                    }
+
+                    // Check for conditions
+                    smatch conditionMatch;
+                    if (regex_search(line, conditionMatch, conditionPattern)) {
+                        string condition = conditionMatch[1];
+                        if (cases.find(condition) != cases.end()) {
+                            violations.push_back({ "Duplicate condition in case statement: " + condition, i + 1 });
+                        }
+                        cases.insert(condition);
+                    }
+
+                    // Break on `endcase`
+                    if (regex_search(line, endCasePattern)) {
+                        break;
+                    }
+                }
+
+                // Check for missing default case
+                if (!hasDefault) {
+                    violations.push_back({ "Missing default case in case statement starting at line " + to_string(caseStartLine + 1), caseStartLine + 1 });
+                }
+            }
+        }
+    }
+
+    // Function to detect unreachable branches
+    void checkDeadCode() {
+        regex regRegex(R"(\s*reg\s*\[\s*(\d+)\s*:\s*0\s*\]\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*;)");
+        regex caseRegex(R"(\s*case\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\))");
+        regex caseBranchRegex(R"(\s*(\d+'b[01]+)\s*:.*)");
+        regex ifElseRegex(R"(\s*(if|else if|else)\s*\(?\s*.*?\)?\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(\d+'b[01]+)\s*;)");
+        regex ifConditionRegex(R"(\s*(if|else if)\s*\(\s*(.*?)\s*\))"); // To match if and else if conditions
+
+        string currentSelector;
+        unordered_set<string> reachableValues; // Track reachable values
+        vector<pair<string, size_t>> caseBranches; // Values from case statement with line numbers
+        bool inCaseBlock = false;
+        unordered_set<int> unreachableIfElseLines; // To track unreachable if-else lines
+
+        for (size_t lineNumber = 0; lineNumber < lines.size(); ++lineNumber) {
+            string line = lines[lineNumber];
+            smatch match;
+
+            // Detect register declaration
+            if (regex_search(line, match, regRegex)) {
+                currentSelector = match[2];
+            }
+
+            // Track assignments to the selector variable
+            if (regex_search(line, match, ifElseRegex)) {
+                if (match[2] == currentSelector) {
+                    reachableValues.insert(match[3]); // Add assigned value
+                }
+            }
+
+            // Start analyzing a case block
+            if (regex_search(line, match, caseRegex)) {
+                if (match[1] == currentSelector) {
+                    inCaseBlock = true;
+                    caseBranches.clear();
+                }
+            }
+
+            // Collect values in case branches with line numbers
+            if (inCaseBlock && regex_search(line, match, caseBranchRegex)) {
+                caseBranches.emplace_back(match[1], lineNumber + 1);
+            }
+
+            // End of case block
+            if (inCaseBlock && line.find("endcase") != string::npos) {
+                inCaseBlock = false;
+
+                // Compare reachable values with case branches
+                unordered_set<size_t> unreachableBranchLines;
+                for (const auto& branch : caseBranches) {
+                    if (reachableValues.find(branch.first) == reachableValues.end()) {
+                        unreachableBranchLines.insert(branch.second);
+                    }
+                }
+
+                // Report unreachable branches with line numbers
+                for (const auto& branchLine : unreachableBranchLines) {
+                    violations.push_back({ "Unreachable 'case' branch at line: " + to_string(branchLine), static_cast<int>(branchLine) });
+                }
+            }
+
+            // Check for unreachable if-else conditions
+            if (regex_search(line, match, ifConditionRegex)) {
+                string condition = match[2];
+
+                // For simplicity, assume conditions that are always false (simplified analysis)
+                if (condition == "1'b0" || condition == "0") { // Example: Always false condition
+                    unreachableIfElseLines.insert(lineNumber + 1); // Mark this line as unreachable
+                }
+            }
+        }
+
+        // Report unreachable if-else branches
+        for (const auto& line : unreachableIfElseLines) {
+            violations.push_back({ "Unreachable if-else statement at line: " + to_string(line), line });
+        }
+    }
+
+    // Arithmetic Overflow Checks
+    void checkArithmeticOverflow() {
+        // Match for variable declarations with bit-widths, including multiple variables in one line.
+        regex declarationPattern(R"(reg\s*\[(\d+):(\d+)\]\s*(\w+)(?:\s*,\s*(\w+))*;)");
+        // Matches: reg [3:0] a, b; (including multiple variables)
+
+        regex assignmentPattern(R"(\s*(\w+)\s*=\s*(.+);)");          // Matches assignment statements
+        regex operationPattern(R"((\w+)\s*([\+\-\*\/])\s(\w+))");
+
+        unordered_map<string, int> variableBitWidths; // Map to store bit widths for variables
+
+        // Step 1: Extract bit widths from variable declarations
+        for (const string& line : lines) {
+            smatch match;
+            if (regex_search(line, match, declarationPattern)) {
+                int msb = stoi(match[1]); // Extract most significant bit
+                int lsb = stoi(match[2]); // Extract least significant bit
+                string variableName = match[3];
+                int bitWidth = msb - lsb + 1; // Calculate bit width
+
+                // Store the bit-width for the first variable
+                variableBitWidths[variableName] = bitWidth;
+
+                // Handle additional variables in the declaration
+                for (size_t i = 4; i < match.size(); ++i) {
+                    if (match[i].matched) {
+                        variableBitWidths[match[i]] = bitWidth;
+                    }
+                }
+            }
+        }
+
+        // Step 2: Detect arithmetic operations and check for overflow
+        for (int i = 0; i < lines.size(); ++i) {
+            string line = lines[i];
+            smatch match;
+
+            // Detect assignment statements
+            if (regex_search(line, match, assignmentPattern)) {
+                string destination = match[1];  // Left-hand side of assignment
+                string expression = match[2];  // Right-hand side (arithmetic operation)
+
+                smatch opMatch;
+                if (regex_search(expression, opMatch, operationPattern)) {
+                    string operand1 = opMatch[1];
+                    string operation = opMatch[2];
+                    string operand2 = opMatch[3];
+
+                    // Determine bit widths of the operands
+                    int bitWidth1 = variableBitWidths.count(operand1) ? variableBitWidths[operand1] : 8;
+                    int bitWidth2 = variableBitWidths.count(operand2) ? variableBitWidths[operand2] : 8;
+                    int resultBitWidth = variableBitWidths.count(destination) ? variableBitWidths[destination] : 8;
+
+                    bool overflow = false;
+                    // Check for overflow conditions
+                    if (operation == "+") {
+                        overflow = (max(bitWidth1, bitWidth2) + 1 > resultBitWidth); // +1 for carry
+
+                    }
+                    else if (operation == "-") {
+                        overflow = (bitWidth1 < bitWidth2 );
+                    }
+                    else if (operation == "*") {
+                        overflow = (bitWidth1 + bitWidth2 > resultBitWidth);
+                    }
+                    
+
+                    // Report potential overflow
+                    if (overflow) {
+                        violations.push_back({
+                            "Potential arithmetic overflow in operation: " + operand1 + " " + operation + " " + operand2,
+                            i + 1
+                            });
+                    }
+                }
             }
         }
     }
@@ -584,14 +614,16 @@ public:
     explicit StaticChecker(const vector<string>& lines) : lines(lines) {}
 
     void runChecks() {
-        checkUnreachableFSMStates();
-        checkUninitializedRegisters();
-        checkXPropagation();
-        checkCombinationalLoops();
-        checkCaseStatements();
+        //checkUnreachableFSMStates();
+        //checkUninitializedRegisters();
+        //checkLatchInference();
+        //checkXPropagation();
+        //checkCombinationalLoops();
+        //checkCaseStatements();
+        //checkDeadCode();
+
         checkArithmeticOverflow();
-        checkDeadCode();
-        checkLatchInference();
+
     }
 
     void reportViolations() const {

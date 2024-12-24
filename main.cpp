@@ -662,6 +662,31 @@ private:
         }
     }
 
+    void checkMultiDrivenBus() {
+        regex assignPattern(R"(assign\s+(\w+)\s*=\s*(.*?);)"); // Matches 'assign bus = ...;'
+        unordered_map<string, vector<string>> busAssignments;   // Tracks conditions per bus
+
+        for (size_t i = 0; i < lines.size(); ++i) {
+            string line = lines[i];
+            smatch match;
+
+            // Search for 'assign' statements
+            if (regex_search(line, match, assignPattern)) {
+                string busName = match[1];      // Extract the bus name
+                string condition = match[2];    // Extract the assigned condition or value
+
+                busAssignments[busName].push_back(condition);
+
+                // Check for conflicting drivers
+                if (busAssignments[busName].size() > 1) {
+                    violations.push_back({ "Bus value conflict detected: " + busName, static_cast<int>(i + 1) });
+                }
+            }
+        }
+    }
+
+
+
 public:
     explicit StaticChecker(const vector<string>& lines) : lines(lines) {}
 
@@ -674,6 +699,7 @@ public:
         checkCaseStatements();
         checkDeadCode();
         checkArithmeticOverflow();
+        checkMultiDrivenBus();
 
     }
 
